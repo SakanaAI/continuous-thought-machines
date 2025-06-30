@@ -97,6 +97,7 @@ class ContinuousThoughtMachine(nn.Module):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 adaptive_eviction=False,
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -114,6 +115,7 @@ class ContinuousThoughtMachine(nn.Module):
         self.neuron_select_type = neuron_select_type
         self.memory_length = memory_length
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
+        self.adaptive_eviction = adaptive_eviction
 
         # --- Assertions ---
         self.verify_args()
@@ -130,6 +132,17 @@ class ContinuousThoughtMachine(nn.Module):
         # --- Core CTM Modules ---
         self.synapses = self.get_synapses(synapse_depth, d_model, dropout)
         self.trace_processor = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout_nlm)
+        
+        if self.adaptive_eviction:
+            self.eviction_picker = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(d_model*memory_length, 2*memory_hidden_dims),
+                nn.ReLU(),
+                nn.Linear(2*memory_hidden_dims, memory_hidden_dims),
+                nn.ReLU(),
+                nn.Linear(memory_hidden_dims, memory_length),
+                nn.Softmax(dim=-1)  # Softmax over the memory length dimension
+            )
 
         #  --- Start States ---
         self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
@@ -522,8 +535,22 @@ class ContinuousThoughtMachine(nn.Module):
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
-            # The 'state_trace' is the history of incoming pre-activations
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            # # The 'state_trace' is the history of incoming pre-activations
+            if self.adaptive_eviction:
+                eviction_probs = self.eviction_picker(state_trace)
+                # argmax
+                eviction_index = torch.argmax(eviction_probs, dim=-1)  # Shape: (B,)
+
+                mask = torch.ones((B, self.memory_length), device=device, dtype=torch.bool)
+                mask[torch.arange(B), eviction_index] = False
+
+                mask = mask.unsqueeze(1).expand(-1, self.d_model, -1)  # Shape: (B, H, T)
+
+                retain_stack_trace = state_trace.masked_select(mask).reshape(B, self.d_model, self.memory_length - 1)
+
+                state_trace = torch.cat((retain_stack_trace, state.unsqueeze(-1)), dim=-1)
+            else:
+                state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)

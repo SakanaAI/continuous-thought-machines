@@ -27,6 +27,7 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 adaptive_eviction=False,
                  ):
         super().__init__(
             iterations=iterations,
@@ -48,6 +49,7 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
             dropout_nlm=dropout_nlm,
             neuron_select_type=neuron_select_type,
             n_random_pairing_self=n_random_pairing_self,
+            adaptive_eviction=adaptive_eviction,
         )
 
         # --- Use a minimal CTM w/out input (action) synch ---
@@ -95,8 +97,21 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
-            # The 'state_trace' is the history of incoming pre-activations
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            if self.adaptive_eviction:
+                eviction_probs = self.eviction_picker(state_trace)
+                # argmax
+                eviction_index = torch.argmax(eviction_probs, dim=-1)  # Shape: (B,)
+
+                mask = torch.ones((B, self.memory_length), device=device, dtype=torch.bool)
+                mask[torch.arange(B), eviction_index] = False
+
+                mask = mask.unsqueeze(1).expand(-1, self.d_model, -1)  # Shape: (B, H, T)
+
+                retain_stack_trace = state_trace.masked_select(mask).reshape(B, self.d_model, self.memory_length - 1)
+
+                state_trace = torch.cat((retain_stack_trace, state.unsqueeze(-1)), dim=-1)
+            else:
+                state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)
