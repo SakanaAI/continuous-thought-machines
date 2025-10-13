@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch
 import numpy as np
 import math
+from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
 from models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
 from models.resnet import prepare_resnet_backbone
@@ -13,7 +14,7 @@ from models.constants import (
     VALID_POSITIONAL_EMBEDDING_TYPES
 )
 
-class ContinuousThoughtMachine(nn.Module):
+class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin, repo_url="ciaran-regan-ie/continuous-thought-machines", license="apache-2.0"):
     """
     Continuous Thought Machine (CTM).
 
@@ -148,6 +149,46 @@ class ContinuousThoughtMachine(nn.Module):
 
         # --- Output Procesing ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        *,
+        model_id: str,
+        revision=None,
+        cache_dir=None,
+        force_download=False,
+        proxies=None,
+        resume_download=None,
+        local_files_only=False,
+        token=None,
+        map_location="cpu",
+        strict=False,
+        **model_kwargs,
+    ):
+        """Override to handle lazy weights initialization."""
+        model = cls(**model_kwargs).to(map_location)
+
+        dummy = torch.randn(1, 3, 224, 224, device=map_location)
+        with torch.no_grad():
+            _ = model(dummy)
+
+        model_file = hf_hub_download(
+            repo_id=model_id,
+            filename="model.safetensors",
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            token=token,
+            local_files_only=local_files_only,
+        )
+        from safetensors.torch import load_model as load_model_as_safetensor
+        load_model_as_safetensor(model, model_file, strict=strict, device=map_location)
+
+        model.eval()
+        return model
 
     # --- Core CTM Methods ---
 
@@ -553,3 +594,4 @@ class ContinuousThoughtMachine(nn.Module):
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
+

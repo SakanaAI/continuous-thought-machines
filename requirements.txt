@@ -13,3 +13,5 @@ gymnasium
 minigrid
 datasets
 autoclip
+huggingface_hub
+safetensors
