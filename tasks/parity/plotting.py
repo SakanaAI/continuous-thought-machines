@@ -13,6 +13,7 @@ import imageio.v2 as imageio
 from PIL import Image
 import math
 import re
+from tqdm import tqdm
 sns.set_style('darkgrid')
 mpl.use('Agg')
 
@@ -43,7 +44,7 @@ def make_parity_gif(predictions, certainties, targets, pre_activations, post_act
              [['certainty', 'certainty', 'certainty', 'certainty', 'certainty', 'certainty', 'certainty', 'certainty']] + \
              [[f'trace_{ti}', f'trace_{ti}', f'trace_{ti}', f'trace_{ti}', f'trace_{ti}', f'trace_{ti}', f'trace_{ti}', f'trace_{ti}'] for ti in range(n_neurons_to_visualise)] 
              
-    for stepi in range(n_steps):
+    for stepi in tqdm(range(n_steps), desc="Processing steps", unit="step"):
         fig_gif, axes_gif = plt.subplot_mosaic(mosaic=mosaic, figsize=(31*figscale*8/4, 76*figscale))
 
         # Plot predictions
