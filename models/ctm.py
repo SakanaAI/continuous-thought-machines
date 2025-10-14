@@ -172,7 +172,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin, repo_url="ciaran
         # The CTM contains Lazy modules, so we must run a dummy forward pass to initialize them
         if "imagenet" in model_id:
             dummy_input = torch.randn(1, 3, 224, 224, device=map_location)
-        elif "mazes-large" in model_id:
+        elif "maze-large" in model_id:
             dummy_input = torch.randn(1, 3, 99, 99, device=map_location)
         else:
             raise NotImplementedError
