@@ -169,9 +169,16 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin, repo_url="ciaran
         """Override to handle lazy weights initialization."""
         model = cls(**model_kwargs).to(map_location)
 
-        dummy = torch.randn(1, 3, 224, 224, device=map_location)
+        # The CTM contains Lazy modules, so we must run a dummy forward pass to initialize them
+        if "imagenet" in model_id:
+            dummy_input = torch.randn(1, 3, 224, 224, device=map_location)
+        elif "mazes-large" in model_id:
+            dummy_input = torch.randn(1, 3, 99, 99, device=map_location)
+        else:
+            raise NotImplementedError
+
         with torch.no_grad():
-            _ = model(dummy)
+            _ = model(dummy_input)
 
         model_file = hf_hub_download(
             repo_id=model_id,
