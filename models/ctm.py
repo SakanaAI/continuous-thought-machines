@@ -14,7 +14,7 @@ from models.constants import (
     VALID_POSITIONAL_EMBEDDING_TYPES
 )
 
-class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin, repo_url="ciaran-regan-ie/continuous-thought-machines", license="apache-2.0"):
+class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
     """
     Continuous Thought Machine (CTM).
 
