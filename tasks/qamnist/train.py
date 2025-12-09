@@ -148,7 +148,6 @@ if __name__=='__main__':
         device = 'mps'
     else:
         device = 'cpu'
-    print(f'Running model {args.d_model} on {device}')
 
     # Build model
     model = prepare_model(args, device)
