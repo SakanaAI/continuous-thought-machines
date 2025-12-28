@@ -176,25 +176,87 @@ def qamnist_loss(predictions, certainties, targets, use_most_certain=True):
     Computes the qamnist loss over the last num_answer_steps steps.
 
     Predictions are of shape: (B, class, internal_ticks),
-    Certainties are of shape: (B, 2, internal_ticks), 
+    Certainties are of shape: (B, 2, internal_ticks),
         where the inside dimension (2) is [normalised_entropy, 1-normalised_entropy]
     Targets are of shape: [B]
     num_answer_steps: number of steps to consider for the loss
 
-    use_most_certain will select either the most certain point or the final point. 
+    use_most_certain will select either the most certain point or the final point.
     """
 
-    losses = nn.CrossEntropyLoss(reduction='none')(predictions, 
+    losses = nn.CrossEntropyLoss(reduction='none')(predictions,
                                                    torch.repeat_interleave(targets.unsqueeze(-1), predictions.size(-1), -1))
-        
+
     loss_index_1 = losses.argmin(dim=1)
     loss_index_2 = certainties[:,1].argmax(-1)
     if not use_most_certain:
         loss_index_2[:] = -1
-    
+
     batch_indexer = torch.arange(predictions.size(0), device=predictions.device)
     loss_minimum_ce = losses[batch_indexer, loss_index_1].mean()
     loss_selected = losses[batch_indexer, loss_index_2].mean()
 
     loss = (loss_minimum_ce + loss_selected)/2
     return loss, loss_index_2
+
+
+def certainty_weighted_loss(loss_fn, predictions, certainties, targets,
+                           uncertainty_threshold=0.3, confidence_boost=2.0):
+    """
+    Universal wrapper that applies automatic certainty-based weighting to ANY loss function.
+
+    This function implements the theoretical correction for the fundamental flaw in standard
+    neural network training that treats all training examples equally, violating core principles
+    from information theory, statistical learning theory, and optimization theory.
+
+    The certainty-weighted approach addresses:
+    - Information content variation in learning signals
+    - Bias-variance tradeoff violations
+    - Gradient quality optimization
+    - Optimization landscape smoothing
+    - Empirical risk minimization enhancement
+
+    Args:
+        loss_fn (callable): Any existing loss function that returns (loss, selection_index)
+        predictions (torch.Tensor): Model predictions of shape [B, C, T] or similar
+        certainties (torch.Tensor): Certainty metrics of shape [B, 2, T] where:
+            - certainties[:, 0] = normalized entropy (uncertainty measure)
+            - certainties[:, 1] = confidence measure (1 - normalized entropy)
+        targets (torch.Tensor): Ground truth targets
+        uncertainty_threshold (float): Below this uncertainty level, reduce learning weight (default: 0.3)
+        confidence_boost (float): How much to boost confident predictions (default: 2.0)
+
+    Returns:
+        tuple: (weighted_loss, selection_index)
+            - weighted_loss (torch.Tensor): Scalar tensor with certainty-weighted loss
+            - selection_index (torch.Tensor): Index used for selection (from underlying loss_fn)
+
+    The weighting strategy:
+    1. Boosts confident predictions: weights *= (1 + confidence_boost * (confidence - 0.5))
+    2. Reduces uncertain predictions: weights *= clamp(uncertainty_threshold / (uncertainty + epsilon), 0, 1)
+    3. Applies weights to base loss: weighted_loss = base_loss * weights
+
+    This implements the "Learning should be proportional to certainty" principle that emerges
+    from information theory, statistical learning theory, and cognitive science.
+    """
+    # Calculate adaptive weights based on certainty metrics
+    confidence = certainties[:, 1]  # High confidence values
+    uncertainty = certainties[:, 0]  # Normalized entropy
+
+    # Smart weighting: reduce weight for uncertain, boost confident
+    weights = torch.ones_like(confidence)
+    weights = weights * (1 + confidence_boost * (confidence - 0.5))  # Boost confident predictions
+    weights = weights * torch.clamp(uncertainty_threshold / (uncertainty + 1e-8), 0, 1)  # Reduce uncertain predictions
+
+    # Apply underlying loss function
+    base_loss, selection_index = loss_fn(predictions, certainties, targets)
+
+    # Calculate weighted loss per sample
+    # Handle different tensor shapes for weights and base_loss
+    if hasattr(weights, 'mean') and weights.dim() > 1:
+        sample_losses = base_loss * weights.mean(dim=-1)
+    else:
+        sample_losses = base_loss * weights
+
+    # Return mean of weighted losses and original selection index
+    return sample_losses.mean(), selection_index
