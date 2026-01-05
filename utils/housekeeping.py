@@ -20,7 +20,7 @@ def zip_python_code(output_filename):
     with zipfile.ZipFile(output_filename, 'w') as zipf:
         files = glob.glob('models/**/*.py', recursive=True) + glob.glob('utils/**/*.py', recursive=True) + glob.glob('tasks/**/*.py', recursive=True) + glob.glob('*.py', recursive=True)
         for file in files:
-            zipf.write(file, arcname=file)
+            zipf.write(file, arcname=file.replace(os.sep, '/'))
 
 def set_seed(seed=42, deterministic=True):
     """
