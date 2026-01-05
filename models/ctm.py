@@ -239,11 +239,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 selected_left = activated_state[:, neuron_indices_left]
                 selected_right = activated_state[:, neuron_indices_right]
             
-            # Compute outer product of selected neurons
-            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
-            # Resulting matrix is symmetric, so we only need the upper triangle
-            i, j = torch.triu_indices(n_synch, n_synch)
-            pairwise_product = outer[:, i, j]
+            # Compute pairwise products efficiently without intermediate tensor
+            i, j = torch.triu_indices(n_synch, n_synch, device=activated_state.device)
+            pairwise_product = selected_left[:, i] * selected_right[:, j]
             
         elif self.neuron_select_type == 'random-pairing':
             # For random-pairing, we compute the sync between specific pairs of neurons
