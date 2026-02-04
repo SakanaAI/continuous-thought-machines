@@ -81,6 +81,10 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='GPU(s) or -1 for CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
+    # Early stopping and best checkpoint (optional, disabled by default)
+    parser.add_argument('--early_stopping_patience', type=int, default=-1, help='Stop training if test metric does not improve for this many validations. -1 to disable.')
+    parser.add_argument('--save_best_checkpoint', action=argparse.BooleanOptionalAction, default=False, help='Save best model checkpoint separately as best_checkpoint.pt.')
+
     args = parser.parse_args()
     return args
 
@@ -163,6 +167,8 @@ if __name__=='__main__':
     train_accuracies_most_certain_per_input = []
     test_accuracies_most_certain_per_input = []
     iters = []
+    best_test_metric = -float('inf')
+    early_stopping_counter = 0
     scaler = torch.amp.GradScaler("cuda" if "cuda" in device else "cpu", enabled=args.use_amp)
 
     # Now that everything is initliased, reload if desired
@@ -185,6 +191,9 @@ if __name__=='__main__':
             test_accuracies_most_certain_per_input = checkpoint['test_accuracies_most_certain_per_input'] if 'test_accuracies_most_certain_per_input' in checkpoint else test_accuracies_most_certain_per_input
             test_accuracies = checkpoint['test_accuracies']
             iters = checkpoint['iters']
+            # Load early stopping state (backward compatible)
+            best_test_metric = checkpoint.get('best_test_metric', -float('inf'))
+            early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
         else:
             print('Only relading model!')
         if 'torch_rng_state' in checkpoint:
@@ -337,7 +346,19 @@ if __name__=='__main__':
                         test_accuracies_most_certain.append((all_targets == all_predictions_most_certain).mean())
                         test_accuracies_most_certain_per_input.append((all_targets == all_predictions_most_certain).reshape(all_targets.shape[0], -1).all(-1).mean())
                         test_losses.append(np.mean(all_losses))
-                            
+
+                        # Best model checkpoint and early stopping
+                        current_metric = test_accuracies_most_certain[-1]
+                        if current_metric > best_test_metric:
+                            best_test_metric = current_metric
+                            early_stopping_counter = 0
+                            if args.save_best_checkpoint:
+                                torch.save({'model_state_dict': model.state_dict(),
+                                             'iteration': bi, 'best_test_metric': best_test_metric, 'args': args},
+                                            f'{args.log_dir}/best_checkpoint.pt')
+                                print(f'New best model saved at iteration {bi} with metric {best_test_metric:.4f}')
+                        else:
+                            early_stopping_counter += 1
 
                         figacc = plt.figure(figsize=(10, 10))
                         axacc_train = figacc.add_subplot(211)
@@ -345,18 +366,18 @@ if __name__=='__main__':
                         cm = sns.color_palette("viridis", as_cmap=True)
                         if args.dataset != 'sort':
                             for ti, (train_acc, test_acc) in enumerate(zip(np.array(train_accuracies).T, np.array(test_accuracies).T)):
-                                axacc_train.plot(iters, train_acc, color=cm((ti)/(train_accuracies[0].shape[-1])), alpha=0.3)       
-                                axacc_test.plot(iters, test_acc, color=cm((ti)/(test_accuracies[0].shape[-1])), alpha=0.3)  
-                        axacc_train.plot(iters, train_accuracies_most_certain, 'k--', alpha=0.7, label='Most certain')   
-                        axacc_train.plot(iters, train_accuracies_most_certain_per_input, 'r', alpha=0.6, label='Full Input')        
-                        axacc_test.plot(iters, test_accuracies_most_certain, 'k--', alpha=0.7, label='Most certain')        
-                        axacc_test.plot(iters, test_accuracies_most_certain_per_input, 'r', alpha=0.6, label='Full Input')        
+                                axacc_train.plot(iters, train_acc, color=cm((ti)/(train_accuracies[0].shape[-1])), alpha=0.3)
+                                axacc_test.plot(iters, test_acc, color=cm((ti)/(test_accuracies[0].shape[-1])), alpha=0.3)
+                        axacc_train.plot(iters, train_accuracies_most_certain, 'k--', alpha=0.7, label='Most certain')
+                        axacc_train.plot(iters, train_accuracies_most_certain_per_input, 'r', alpha=0.6, label='Full Input')
+                        axacc_test.plot(iters, test_accuracies_most_certain, 'k--', alpha=0.7, label='Most certain')
+                        axacc_test.plot(iters, test_accuracies_most_certain_per_input, 'r', alpha=0.6, label='Full Input')
                         axacc_train.set_title('Train')
                         axacc_test.set_title('Test')
                         axacc_train.legend(loc='lower right')
                         axacc_train.set_xlim([0, args.training_iterations])
                         axacc_test.set_xlim([0, args.training_iterations])
-                        
+
                         figacc.tight_layout()
                         figacc.savefig(f'{args.log_dir}/accuracies.png', dpi=150)
                         plt.close(figacc)
@@ -373,9 +394,11 @@ if __name__=='__main__':
                         plt.close(figloss)
 
                 model.train()
-                            
 
-
+                if args.early_stopping_patience != -1 and early_stopping_counter >= args.early_stopping_patience:
+                    print(f'Early stopping triggered at iteration {bi}. '
+                          f'No improvement for {args.early_stopping_patience} validations.')
+                    break
 
             # Save model
             if (bi%args.save_every==0 or bi==args.training_iterations-1):
@@ -396,6 +419,8 @@ if __name__=='__main__':
                     'test_losses':test_losses,
                     'iters':iters,
                     'args':args,
+                    'best_test_metric': best_test_metric,
+                    'early_stopping_counter': early_stopping_counter,
                     'torch_rng_state': torch.get_rng_state(),
                     'numpy_rng_state': np.random.get_state(),
                     'random_rng_state': random.getstate(),
