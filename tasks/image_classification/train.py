@@ -119,6 +119,9 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='List of GPU(s) to use. Set to -1 to use CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
+    # Early stopping and best checkpoint (optional, disabled by default)
+    parser.add_argument('--early_stopping_patience', type=int, default=-1, help='Stop training if test metric does not improve for this many validations. -1 to disable.')
+    parser.add_argument('--save_best_checkpoint', action=argparse.BooleanOptionalAction, default=False, help='Save best model checkpoint separately as best_checkpoint.pt.')
 
     args = parser.parse_args()
     return args
@@ -326,6 +329,9 @@ if __name__=='__main__':
     train_accuracies_most_certain = [] if args.model in ['ctm', 'lstm'] else None
     test_accuracies_most_certain = [] if args.model in ['ctm', 'lstm'] else None
 
+    best_test_metric = -float('inf')
+    early_stopping_counter = 0
+
     scaler = torch.amp.GradScaler("cuda" if "cuda" in device else "cpu", enabled=args.use_amp)
 
     # Reloading logic
@@ -355,6 +361,10 @@ if __name__=='__main__':
                 if args.model in ['ctm', 'lstm']:
                     train_accuracies_most_certain = checkpoint['train_accuracies_most_certain']
                     test_accuracies_most_certain = checkpoint['test_accuracies_most_certain']
+
+                # Load early stopping state (backward compatible)
+                best_test_metric = checkpoint.get('best_test_metric', -float('inf'))
+                early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
 
             else:
                 print('Only reloading model!')
@@ -567,6 +577,26 @@ if __name__=='__main__':
                          current_test_accuracies = (all_targets == all_predictions).mean()
                          test_accuracies.append(current_test_accuracies)
 
+                # Best model checkpoint and early stopping
+                if args.model in ['ctm', 'lstm']:
+                    current_metric = current_test_accuracies_most_certain
+                else:
+                    current_metric = current_test_accuracies
+                if current_metric > best_test_metric:
+                    best_test_metric = current_metric
+                    early_stopping_counter = 0
+                    if args.save_best_checkpoint:
+                        torch.save({'model_state_dict': model.state_dict(),
+                                     'iteration': bi, 'best_test_metric': best_test_metric, 'args': args},
+                                    f'{args.log_dir}/best_checkpoint.pt')
+                        print(f'New best model saved at iteration {bi} with metric {best_test_metric:.4f}')
+                else:
+                    early_stopping_counter += 1
+                    if args.early_stopping_patience != -1 and early_stopping_counter >= args.early_stopping_patience:
+                        print(f'Early stopping triggered at iteration {bi}. '
+                              f'No improvement for {args.early_stopping_patience} validations.')
+                        break
+
                 # Plotting (conditional)
                 figacc = plt.figure(figsize=(10, 10))
                 axacc_train = figacc.add_subplot(211)
@@ -675,6 +705,9 @@ if __name__=='__main__':
                     'test_accuracies': test_accuracies, # This is list of scalars for FF, list of arrays for CTM/LSTM
                     'iters': iters,
                     'args': args, # Save args used for this run
+                    # Early stopping state
+                    'best_test_metric': best_test_metric,
+                    'early_stopping_counter': early_stopping_counter,
                     # RNG states
                     'torch_rng_state': torch.get_rng_state(),
                     'numpy_rng_state': np.random.get_state(),

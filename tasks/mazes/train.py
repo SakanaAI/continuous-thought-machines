@@ -126,6 +126,9 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='List of GPU(s) to use. Set to -1 to use CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
+    # Early stopping and best checkpoint (optional, disabled by default)
+    parser.add_argument('--early_stopping_patience', type=int, default=-1, help='Stop training if test metric does not improve for this many validations. -1 to disable.')
+    parser.add_argument('--save_best_checkpoint', action=argparse.BooleanOptionalAction, default=False, help='Save best model checkpoint separately as best_checkpoint.pt.')
 
     args = parser.parse_args()
     return args
@@ -287,6 +290,9 @@ if __name__=='__main__':
     test_accuracies_most_certain_permaze = []  
     iters = []
 
+    best_test_metric = -float('inf')
+    early_stopping_counter = 0
+
     scaler = torch.amp.GradScaler("cuda" if "cuda" in device else "cpu", enabled=args.use_amp)
     if args.reload:
         checkpoint_path = f'{args.log_dir}/checkpoint.pt'
@@ -316,6 +322,10 @@ if __name__=='__main__':
                     test_accuracies_most_certain_permaze = checkpoint['test_accuracies_most_certain_permaze']
                 else:
                      print("Ignoring metrics history upon reload.")
+
+                # Load early stopping state (backward compatible)
+                best_test_metric = checkpoint.get('best_test_metric', -float('inf'))
+                early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
 
             else:
                 print('Only reloading model!')
@@ -587,89 +597,105 @@ if __name__=='__main__':
                     # Calculate full maze accuracy
                     test_accuracies_most_certain_permaze.append((all_targets == all_predictions_most_certain).reshape(all_targets.shape[0], -1).all(-1).mean()) # Scalar
 
+                # Best model checkpoint and early stopping
+                current_metric = test_accuracies_most_certain_permaze[-1]
+                if current_metric > best_test_metric:
+                    best_test_metric = current_metric
+                    early_stopping_counter = 0
+                    if args.save_best_checkpoint:
+                        torch.save({'model_state_dict': model.state_dict(),
+                                     'iteration': bi, 'best_test_metric': best_test_metric, 'args': args},
+                                    f'{args.log_dir}/best_checkpoint.pt')
+                        print(f'New best model saved at iteration {bi} with metric {best_test_metric:.4f}')
+                else:
+                    early_stopping_counter += 1
+                    if args.early_stopping_patience != -1 and early_stopping_counter >= args.early_stopping_patience:
+                        print(f'Early stopping triggered at iteration {bi}. '
+                              f'No improvement for {args.early_stopping_patience} validations.')
+                        break
 
-                    # --- Plotting ---
-                    # Accuracy Plot (Handling different dimensions)
-                    figacc = plt.figure(figsize=(10, 10))
-                    axacc_train = figacc.add_subplot(211)
-                    axacc_test = figacc.add_subplot(212)
-                    cm = sns.color_palette("viridis", as_cmap=True)
+                # --- Plotting ---
+                # Accuracy Plot (Handling different dimensions)
+                figacc = plt.figure(figsize=(10, 10))
+                axacc_train = figacc.add_subplot(211)
+                axacc_test = figacc.add_subplot(212)
+                cm = sns.color_palette("viridis", as_cmap=True)
 
-                    # Plot per step/tick accuracy
-                    # train_accuracies is List[(S, T)] or List[(S,)]
-                    # We need to average over S dimension for plotting
-                    train_acc_plot = [np.mean(acc_s) for acc_s in train_accuracies] # List[Scalar] or List[Scalar] after mean
-                    test_acc_plot = [np.mean(acc_s) for acc_s in test_accuracies]   # List[Scalar] or List[Scalar] after mean
+                # Plot per step/tick accuracy
+                # train_accuracies is List[(S, T)] or List[(S,)]
+                # We need to average over S dimension for plotting
+                train_acc_plot = [np.mean(acc_s) for acc_s in train_accuracies] # List[Scalar] or List[Scalar] after mean
+                test_acc_plot = [np.mean(acc_s) for acc_s in test_accuracies]   # List[Scalar] or List[Scalar] after mean
 
-                    axacc_train.plot(iters, train_acc_plot, 'g-', alpha=0.5, label='Avg Step Acc')
-                    axacc_test.plot(iters, test_acc_plot, 'g-', alpha=0.5, label='Avg Step Acc')
+                axacc_train.plot(iters, train_acc_plot, 'g-', alpha=0.5, label='Avg Step Acc')
+                axacc_test.plot(iters, test_acc_plot, 'g-', alpha=0.5, label='Avg Step Acc')
 
 
-                    # Plot most certain accuracy 
-                    axacc_train.plot(iters, train_accuracies_most_certain, 'k--', alpha=0.7, label='Most Certain (Avg Step)')
-                    axacc_test.plot(iters, test_accuracies_most_certain, 'k--', alpha=0.7, label='Most Certain (Avg Step)')
-                    # Plot full maze accuracy 
-                    axacc_train.plot(iters, train_accuracies_most_certain_permaze, 'r-', alpha=0.6, label='Full Maze')
-                    axacc_test.plot(iters, test_accuracies_most_certain_permaze, 'r-', alpha=0.6, label='Full Maze')
+                # Plot most certain accuracy
+                axacc_train.plot(iters, train_accuracies_most_certain, 'k--', alpha=0.7, label='Most Certain (Avg Step)')
+                axacc_test.plot(iters, test_accuracies_most_certain, 'k--', alpha=0.7, label='Most Certain (Avg Step)')
+                # Plot full maze accuracy
+                axacc_train.plot(iters, train_accuracies_most_certain_permaze, 'r-', alpha=0.6, label='Full Maze')
+                axacc_test.plot(iters, test_accuracies_most_certain_permaze, 'r-', alpha=0.6, label='Full Maze')
 
-                    axacc_train.set_title('Train Accuracy')
-                    axacc_test.set_title('Test Accuracy')
-                    axacc_train.legend(loc='lower right')
-                    axacc_test.legend(loc='lower right')
-                    axacc_train.set_xlim([0, args.training_iterations])
-                    axacc_test.set_xlim([0, args.training_iterations])
-                    axacc_train.set_ylim([0, 1]) # Set Ylim for accuracy
-                    axacc_test.set_ylim([0, 1])
+                axacc_train.set_title('Train Accuracy')
+                axacc_test.set_title('Test Accuracy')
+                axacc_train.legend(loc='lower right')
+                axacc_test.legend(loc='lower right')
+                axacc_train.set_xlim([0, args.training_iterations])
+                axacc_test.set_xlim([0, args.training_iterations])
+                axacc_train.set_ylim([0, 1]) # Set Ylim for accuracy
+                axacc_test.set_ylim([0, 1])
 
-                    figacc.tight_layout()
-                    figacc.savefig(f'{args.log_dir}/accuracies.png', dpi=150)
-                    plt.close(figacc)
+                figacc.tight_layout()
+                figacc.savefig(f'{args.log_dir}/accuracies.png', dpi=150)
+                plt.close(figacc)
 
-                    # Loss Plot
-                    figloss = plt.figure(figsize=(10, 5))
-                    axloss = figloss.add_subplot(111)
-                    axloss.plot(iters, train_losses, 'b-', linewidth=1, alpha=0.8, label=f'Train: {train_losses[-1]:.4f}')
-                    axloss.plot(iters, test_losses, 'r-', linewidth=1, alpha=0.8, label=f'Test: {test_losses[-1]:.4f}')
-                    axloss.legend(loc='upper right')
-                    axloss.set_xlim([0, args.training_iterations])
-                    axloss.set_ylim(bottom=0) 
+                # Loss Plot
+                figloss = plt.figure(figsize=(10, 5))
+                axloss = figloss.add_subplot(111)
+                axloss.plot(iters, train_losses, 'b-', linewidth=1, alpha=0.8, label=f'Train: {train_losses[-1]:.4f}')
+                axloss.plot(iters, test_losses, 'r-', linewidth=1, alpha=0.8, label=f'Test: {test_losses[-1]:.4f}')
+                axloss.legend(loc='upper right')
+                axloss.set_xlim([0, args.training_iterations])
+                axloss.set_ylim(bottom=0)
 
-                    figloss.tight_layout()
-                    figloss.savefig(f'{args.log_dir}/losses.png', dpi=150)
-                    plt.close(figloss)
+                figloss.tight_layout()
+                figloss.savefig(f'{args.log_dir}/losses.png', dpi=150)
+                plt.close(figloss)
 
-                    # --- Visualization Section (Conditional) ---
-                    if args.model in ['ctm', 'lstm']:
-                        #  try:
-                            inputs_viz, targets_viz = next(iter(testloader))
-                            inputs_viz = inputs_viz.to(device)
-                            targets_viz = targets_viz.to(device)
-                            # Find longest path in batch for potentially better visualization
-                            longest_index = (targets_viz!=4).sum(-1).argmax() # Action 4 assumed padding/end
+                # --- Visualization Section (Conditional) ---
+                if args.model in ['ctm', 'lstm']:
+                    #  try:
+                        inputs_viz, targets_viz = next(iter(testloader))
+                        inputs_viz = inputs_viz.to(device)
+                        targets_viz = targets_viz.to(device)
+                        # Find longest path in batch for potentially better visualization
+                        longest_index = (targets_viz!=4).sum(-1).argmax() # Action 4 assumed padding/end
 
-                            # Track internal states
-                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
+                        # Track internal states
+                        predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
 
-                            # Reshape predictions (assuming raw is B, D, T)
-                            predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T
+                        # Reshape predictions (assuming raw is B, D, T)
+                        predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T
 
-                            att_shape = (model.kv_features.shape[2], model.kv_features.shape[3])
-                            attention_tracking_viz = attention_tracking_viz.reshape(
-                                attention_tracking_viz.shape[0], 
-                                attention_tracking_viz.shape[1], -1, att_shape[0], att_shape[1])
+                        att_shape = (model.kv_features.shape[2], model.kv_features.shape[3])
+                        attention_tracking_viz = attention_tracking_viz.reshape(
+                            attention_tracking_viz.shape[0],
+                            attention_tracking_viz.shape[1], -1, att_shape[0], att_shape[1])
 
-                            # Plot dynamics (common plotting function)
-                            plot_neural_dynamics(post_activations_viz, 100, args.log_dir, axis_snap=True)
+                        # Plot dynamics (common plotting function)
+                        plot_neural_dynamics(post_activations_viz, 100, args.log_dir, axis_snap=True)
 
-                            # Create maze GIF (task-specific plotting)
-                            make_maze_gif((inputs_viz[longest_index].detach().cpu().numpy()+1)/2,
-                                          predictions_viz[longest_index].detach().cpu().numpy(), # Pass reshaped B,S,C,T -> S,C,T
-                                          targets_viz[longest_index].detach().cpu().numpy(), # S
-                                          attention_tracking_viz[:, longest_index],  # Pass T, (H), H, W
-                                          args.log_dir)
-                        #  except Exception as e:
-                        #       print(f"Visualization failed for model {args.model}: {e}")
-                    # --- End Visualization ---
+                        # Create maze GIF (task-specific plotting)
+                        make_maze_gif((inputs_viz[longest_index].detach().cpu().numpy()+1)/2,
+                                      predictions_viz[longest_index].detach().cpu().numpy(), # Pass reshaped B,S,C,T -> S,C,T
+                                      targets_viz[longest_index].detach().cpu().numpy(), # S
+                                      attention_tracking_viz[:, longest_index],  # Pass T, (H), H, W
+                                      args.log_dir)
+                    #  except Exception as e:
+                    #       print(f"Visualization failed for model {args.model}: {e}")
+                # --- End Visualization ---
 
                 model.train() # Switch back to train mode
 
@@ -694,6 +720,9 @@ if __name__=='__main__':
                     'test_accuracies_most_certain_permaze': test_accuracies_most_certain_permaze,   # List of scalars
                     'iters': iters,
                     'args': args, # Save args used for this run
+                    # Early stopping state
+                    'best_test_metric': best_test_metric,
+                    'early_stopping_counter': early_stopping_counter,
                     # RNG states
                     'torch_rng_state': torch.get_rng_state(),
                     'numpy_rng_state': np.random.get_state(),

@@ -108,6 +108,9 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='List of GPU(s) to use. Set to -1 to use CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
+    # Early stopping and best checkpoint (optional, disabled by default)
+    parser.add_argument('--early_stopping_patience', type=int, default=-1, help='Stop training if test metric does not improve for this many validations. -1 to disable.')
+    parser.add_argument('--save_best_checkpoint', action=argparse.BooleanOptionalAction, default=False, help='Save best model checkpoint separately as best_checkpoint.pt.')
 
     args = parser.parse_args()
     return args
@@ -191,6 +194,8 @@ if __name__=='__main__':
     train_accuracies_most_certain = []  # This will be selected according to what is returned by loss function
     test_accuracies_most_certain = []
     iters = []
+    best_test_metric = -float('inf')
+    early_stopping_counter = 0
     scaler = torch.amp.GradScaler("cuda" if "cuda" in device else "cpu", enabled=args.use_amp)
 
     # Now that everything is initliased, reload if desired
@@ -211,6 +216,9 @@ if __name__=='__main__':
             test_accuracies_most_certain = checkpoint['test_accuracies_most_certain']
             test_accuracies = checkpoint['test_accuracies']
             iters = checkpoint['iters']
+            # Load early stopping state (backward compatible)
+            best_test_metric = checkpoint.get('best_test_metric', -float('inf'))
+            early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
         else:
             print('Only reloading model!')
         if 'torch_rng_state' in checkpoint:
@@ -391,7 +399,19 @@ if __name__=='__main__':
                         test_accuracies.append(np.mean(all_predictions == all_targets[...,np.newaxis], axis=tuple(range(all_predictions.ndim-1))))
                         test_accuracies_most_certain.append((all_targets == all_predictions_most_certain).mean())
                         test_losses.append(np.mean(all_losses))
-                            
+
+                        # Best model checkpoint and early stopping
+                        current_metric = test_accuracies_most_certain[-1]
+                        if current_metric > best_test_metric:
+                            best_test_metric = current_metric
+                            early_stopping_counter = 0
+                            if args.save_best_checkpoint:
+                                torch.save({'model_state_dict': model.state_dict(),
+                                             'iteration': bi, 'best_test_metric': best_test_metric, 'args': args},
+                                            f'{args.log_dir}/best_checkpoint.pt')
+                                print(f'New best model saved at iteration {bi} with metric {best_test_metric:.4f}')
+                        else:
+                            early_stopping_counter += 1
 
                         figacc = plt.figure(figsize=(10, 10))
                         axacc_train = figacc.add_subplot(211)
@@ -422,9 +442,11 @@ if __name__=='__main__':
                         plt.close(figloss)
 
                 model.train()
-                            
 
-
+                if args.early_stopping_patience != -1 and early_stopping_counter >= args.early_stopping_patience:
+                    print(f'Early stopping triggered at iteration {bi}. '
+                          f'No improvement for {args.early_stopping_patience} validations.')
+                    break
 
             # Save model
             if (bi%args.save_every==0 or bi==args.training_iterations-1) and bi != start_iter:
@@ -444,6 +466,8 @@ if __name__=='__main__':
                     'test_losses':test_losses,
                     'iters':iters,
                     'args':args,
+                    'best_test_metric': best_test_metric,
+                    'early_stopping_counter': early_stopping_counter,
                     'torch_rng_state': torch.get_rng_state(),
                     'numpy_rng_state': np.random.get_state(),
                     'random_rng_state': random.getstate(),

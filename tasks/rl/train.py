@@ -79,6 +79,10 @@ def parse_args():
     parser.add_argument('--track_every', type=int, default=1000, help='Track metrics frequency.')
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='GPU(s) or -1 for CPU.')
 
+    # Early stopping and best checkpoint (optional, disabled by default)
+    parser.add_argument('--early_stopping_patience', type=int, default=-1, help='Stop training if mean episode reward does not improve for this many save intervals. -1 to disable.')
+    parser.add_argument('--save_best_checkpoint', action=argparse.BooleanOptionalAction, default=False, help='Save best model checkpoint separately as best_checkpoint.pt.')
+
     args = parser.parse_args()
     return args
 
@@ -256,7 +260,7 @@ class Agent(nn.Module):
         
         return action, action_probs.log_prob(action), action_probs.entropy(), value, ctm_state, tracking_data, action_logits, action_probs.probs
 
-def save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, save_path):
+def save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, save_path, best_test_metric=-float('inf'), early_stopping_counter=0):
     torch.save({
         'model_state_dict': agent.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -265,7 +269,9 @@ def save_model(agent, optimizer, global_step, training_iteration, episode_reward
         'episode_rewards_tracking': episode_rewards_tracking,
         'episode_lengths_tracking': episode_lengths_tracking,
         'global_steps_tracking': global_steps_tracking,
-        'args': args
+        'args': args,
+        'best_test_metric': best_test_metric,
+        'early_stopping_counter': early_stopping_counter,
     }, save_path)
 
 def load_model(agent, optimizer, checkpoint_path, device):
@@ -393,8 +399,12 @@ if __name__ == "__main__":
     checkpoint_path = f"{args.log_dir}/checkpoint.pt"
     if os.path.exists(checkpoint_path) and args.reload:
         global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, _ = load_model(agent, optimizer, checkpoint_path, device)
+        best_test_metric = checkpoint.get('best_test_metric', -float('inf'))
+        early_stopping_counter = checkpoint.get('early_stopping_counter', 0)
     else:
         global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking = 0, 0, [], [], []
+        best_test_metric = -float('inf')
+        early_stopping_counter = 0
 
     # Rollout buffer
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -583,7 +593,23 @@ if __name__ == "__main__":
             plot_activations(agent, device, args)
 
         if training_iteration % args.save_every == 0 or training_iteration == 1 or global_step == args.total_timesteps-1:
-            save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, f"{args.log_dir}/checkpoint.pt")
+            save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, f"{args.log_dir}/checkpoint.pt", best_test_metric, early_stopping_counter)
+
+            # Best model checkpoint and early stopping (based on recent episode rewards)
+            if len(episode_rewards_tracking) > 0:
+                current_metric = np.mean(episode_rewards_tracking[-100:])
+                if current_metric > best_test_metric:
+                    best_test_metric = current_metric
+                    early_stopping_counter = 0
+                    if args.save_best_checkpoint:
+                        save_model(agent, optimizer, global_step, training_iteration, episode_rewards_tracking, episode_lengths_tracking, global_steps_tracking, args, f"{args.log_dir}/best_checkpoint.pt", best_test_metric, early_stopping_counter)
+                        print(f'New best model saved at iteration {training_iteration} with mean reward {best_test_metric:.4f}')
+                else:
+                    early_stopping_counter += 1
+                    if args.early_stopping_patience != -1 and early_stopping_counter >= args.early_stopping_patience:
+                        print(f'Early stopping triggered at iteration {training_iteration}. '
+                              f'No improvement for {args.early_stopping_patience} save intervals.')
+                        break
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
