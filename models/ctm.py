@@ -113,7 +113,6 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.out_dims = out_dims
         self.positional_embedding_type = positional_embedding_type
         self.neuron_select_type = neuron_select_type
-        self.memory_length = memory_length
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
         # --- Assertions ---
