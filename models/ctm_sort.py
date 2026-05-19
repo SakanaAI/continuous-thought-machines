@@ -61,7 +61,7 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
 
 
 
-    def forward(self, x, track=False):
+    def forward(self, x, track=False, early_exit_threshold=None, return_exit_steps=False):
         B = x.size(0)
         device = x.device
 
@@ -83,6 +83,11 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         certainties = torch.empty(B, 2, self.iterations, device=device, dtype=x.dtype)
 
         # --- Initialise Recurrent Synch Values  ---
+        use_early_exit = early_exit_threshold is not None
+        if use_early_exit or return_exit_steps:
+            finished_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            exit_steps = torch.full((B,), self.iterations, dtype=torch.long, device=device)
+
         r_out = torch.exp(-torch.clamp(self.decay_params_out, 0, 15)).unsqueeze(0).repeat(B, 1)
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
         # Compute learned weighting for synchronisation
@@ -114,6 +119,34 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
 
+            # --- Adaptive Computation Time (ACT) / Early Exit Logic ---
+            if use_early_exit:
+                # 1. Identify samples that just reached the required certainty threshold.
+                is_certain = current_certainty[:, 1] >= early_exit_threshold
+                newly_finished = is_certain & (~finished_mask)
+
+                # Record the step they finished at (1-indexed for step count).
+                exit_steps[newly_finished] = stepi + 1
+
+                # Update the global tracking mask for the batch.
+                finished_mask = finished_mask | is_certain
+
+                # 2. Freeze output history for samples that finished on earlier ticks.
+                # Recurrent state is still computed for the full batch until all samples finish.
+                if stepi > 0:
+                    already_finished = finished_mask ^ newly_finished
+                    if already_finished.any():
+                        predictions[already_finished, ..., stepi] = predictions[already_finished, ..., stepi - 1]
+                        certainties[already_finished, ..., stepi] = certainties[already_finished, ..., stepi - 1]
+
+                # 3. Break the recurrent loop once the whole batch has finished.
+                if finished_mask.all():
+                    for pad_step in range(stepi + 1, self.iterations):
+                        predictions[..., pad_step] = predictions[..., stepi]
+                        certainties[..., pad_step] = certainties[..., stepi]
+                    break
+
+
             # --- Tracking ---
             if track:
                 pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
@@ -122,5 +155,17 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
 
         # --- Return Values ---
         if track:
-            return predictions, certainties, np.array(synch_out_tracking), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+            tracking_outputs = (
+                predictions,
+                certainties,
+                np.array(synch_out_tracking),
+                np.array(pre_activations_tracking),
+                np.array(post_activations_tracking),
+                np.array(attention_tracking),
+            )
+            if return_exit_steps:
+                return (*tracking_outputs, exit_steps)
+            return tracking_outputs
+        if return_exit_steps:
+            return predictions, certainties, synchronisation_out, exit_steps
         return predictions, certainties, synchronisation_out
