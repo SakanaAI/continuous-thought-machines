@@ -76,6 +76,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                         NOTE: when using random-pairing, i-to-i (self) synchronisation is rare, meaning that 'recovering a
                         snapshot representation' (see paper) is difficult. This alleviates that. 
                         NOTE: works fine when set to 0.
+        use_thought_attention (bool): Enable a gated dynamic thought-memory path over completed previous ticks.
+        use_static_thought_trace (bool): Encode a persistent input-derived static thought anchor.
+        thought_attention_dim (int): Query/key width for dynamic thought attention.
+        thought_attention_noise_std (float): Training-only Gaussian noise added to thought-attention logits.
+        thought_attention_recency_init (float): Initial recency bias slope for dynamic thought attention.
+        thought_attention_prev_tick_min/max (float): Optional bounds on attention to the newest completed thought.
     """                               
 
     def __init__(self,
@@ -98,6 +104,13 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 use_thought_attention=False,
+                 use_static_thought_trace=False,
+                 thought_attention_dim=64,
+                 thought_attention_noise_std=0.0,
+                 thought_attention_recency_init=0.0,
+                 thought_attention_prev_tick_min=0.0,
+                 thought_attention_prev_tick_max=1.0,
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -105,6 +118,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.iterations = iterations
         self.d_model = d_model
         self.d_input = d_input
+        self.heads = heads
         self.memory_length = memory_length
         self.prediction_reshaper = prediction_reshaper
         self.n_synch_out = n_synch_out
@@ -113,6 +127,13 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.out_dims = out_dims
         self.positional_embedding_type = positional_embedding_type
         self.neuron_select_type = neuron_select_type
+        self.use_thought_attention = bool(use_thought_attention)
+        self.use_static_thought_trace = bool(use_static_thought_trace)
+        self.thought_attention_dim = int(thought_attention_dim)
+        self.thought_attention_noise_std = float(thought_attention_noise_std)
+        self.thought_attention_recency_init = float(thought_attention_recency_init)
+        self.thought_attention_prev_tick_min = float(thought_attention_prev_tick_min)
+        self.thought_attention_prev_tick_max = float(thought_attention_prev_tick_max)
         self.memory_length = memory_length
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
@@ -146,6 +167,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         if self.synch_representation_size_action:  # if not zero
             self.set_synchronisation_parameters('action', self.n_synch_action, n_random_pairing_self)
         self.set_synchronisation_parameters('out', self.n_synch_out, n_random_pairing_self)
+
+        # --- Thought Memory ---
+        self.set_thought_attention_modules()
 
         # --- Output Procesing ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
@@ -380,6 +404,98 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         else:
             raise ValueError(f"Invalid positional_embedding_type: {self.positional_embedding_type}")
 
+    def set_thought_attention_modules(self):
+        if not self.use_thought_attention:
+            self.thought_memory_dim = 0
+            return
+
+        self.thought_prediction_encoder = nn.Sequential(
+            nn.Linear(self.out_dims, self.d_model),
+            nn.LayerNorm(self.d_model),
+        )
+        self.thought_memory_dim = 3 * self.d_model + self.synch_representation_size_out
+        self.thought_query = nn.Linear(self.d_model, self.thought_attention_dim)
+        self.thought_key = nn.Linear(self.thought_memory_dim, self.thought_attention_dim)
+        self.thought_value = nn.Linear(self.thought_memory_dim, self.d_model)
+
+        thought_update_input_dim = self.d_input + 2 * self.d_model
+        if self.use_static_thought_trace:
+            self.static_thought_encoder = nn.Sequential(
+                nn.Linear(self.d_input, 2 * self.d_model),
+                nn.GLU(),
+                nn.LayerNorm(self.d_model),
+            )
+            thought_update_input_dim += self.d_model
+
+        self.thought_update = nn.Sequential(
+            nn.Linear(thought_update_input_dim, 2 * self.d_model),
+            nn.GLU(),
+            nn.LayerNorm(self.d_model),
+        )
+        self.thought_gate = nn.Linear(thought_update_input_dim, self.d_model)
+
+        ages = torch.arange(self.memory_length - 1, -1, -1, dtype=torch.float32)
+        recency_bias = -self.thought_attention_recency_init * ages
+        self.thought_relative_bias = nn.Parameter(recency_bias)
+
+    def make_thought_entry(self, pre_activation, post_activation, synchronisation_out, prediction):
+        prediction_summary = self.thought_prediction_encoder(prediction)
+        return torch.cat((pre_activation, post_activation, synchronisation_out, prediction_summary), dim=-1)
+
+    def compute_thought_context(self, query_state, thought_memory, thought_valid, previous_slot=-1):
+        query = self.thought_query(query_state).unsqueeze(1)
+        keys = self.thought_key(thought_memory)
+        attention_logits = (query * keys).sum(dim=-1) / math.sqrt(self.thought_attention_dim)
+        relative_bias = self.thought_relative_bias.to(device=attention_logits.device, dtype=attention_logits.dtype)
+        attention_logits = attention_logits + relative_bias.view(1, -1)
+
+        if self.training and self.thought_attention_noise_std > 0:
+            attention_logits = attention_logits + torch.randn_like(attention_logits) * self.thought_attention_noise_std
+
+        attention_logits = attention_logits.masked_fill(~thought_valid, -1e4)
+        attention_weights = torch.softmax(attention_logits, dim=-1)
+        attention_weights = attention_weights * thought_valid.to(dtype=attention_weights.dtype)
+        weight_sum = attention_weights.sum(dim=-1, keepdim=True)
+        has_valid = thought_valid.any(dim=-1, keepdim=True)
+        attention_weights = attention_weights / weight_sum.clamp_min(torch.finfo(attention_weights.dtype).eps)
+        attention_weights = torch.where(has_valid, attention_weights, torch.zeros_like(attention_weights))
+        attention_weights = self.apply_previous_tick_attention_bounds(attention_weights, thought_valid, previous_slot)
+
+        values = self.thought_value(thought_memory)
+        context = torch.sum(attention_weights.unsqueeze(-1) * values, dim=1)
+        return context, attention_weights
+
+    def apply_previous_tick_attention_bounds(self, attention_weights, thought_valid, previous_slot):
+        if self.thought_attention_prev_tick_min <= 0 and self.thought_attention_prev_tick_max >= 1:
+            return attention_weights
+
+        prev_slot = previous_slot
+        if prev_slot < 0:
+            prev_slot = attention_weights.size(-1) + prev_slot
+        if prev_slot < 0 or prev_slot >= attention_weights.size(-1):
+            return attention_weights
+
+        prev_valid = thought_valid[:, prev_slot]
+        if not prev_valid.any():
+            return attention_weights
+
+        prev_weight = attention_weights[:, prev_slot]
+        other_weights = attention_weights.clone()
+        other_weights[:, prev_slot] = 0
+        other_sum = other_weights.sum(dim=-1)
+        has_other = other_sum > torch.finfo(attention_weights.dtype).eps
+        bounded_prev = prev_weight.clamp(
+            min=self.thought_attention_prev_tick_min,
+            max=self.thought_attention_prev_tick_max,
+        )
+        other_scale = (1 - bounded_prev) / other_sum.clamp_min(torch.finfo(attention_weights.dtype).eps)
+        other_scale = torch.where(has_other, other_scale, torch.zeros_like(other_scale))
+
+        bounded = other_weights * other_scale.unsqueeze(-1)
+        bounded[:, prev_slot] = bounded_prev
+        should_bound = prev_valid & has_other
+        return torch.where(should_bound.unsqueeze(-1), bounded, attention_weights)
+
     def get_neuron_level_models(self, deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout):
         """
         Neuron level models are one of the core innovations of the CTM. They apply separate MLPs/linears to 
@@ -509,6 +625,19 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         if self.backbone_type=='none' and self.positional_embedding_type!='none':
             raise AssertionError("There should be no positional embedding if there is no backbone.")
 
+        if self.use_thought_attention and int(self.heads) <= 0:
+            raise AssertionError("use_thought_attention requires attention heads > 0.")
+        if self.use_static_thought_trace and not self.use_thought_attention:
+            raise AssertionError("use_static_thought_trace requires use_thought_attention.")
+        if int(self.thought_attention_dim) < 1:
+            raise AssertionError("thought_attention_dim must be >= 1.")
+        if self.thought_attention_noise_std < 0:
+            raise AssertionError("thought_attention_noise_std must be >= 0.")
+        if self.thought_attention_recency_init < 0:
+            raise AssertionError("thought_attention_recency_init must be >= 0.")
+        if not (0 <= self.thought_attention_prev_tick_min <= self.thought_attention_prev_tick_max <= 1):
+            raise AssertionError("thought_attention_prev_tick_min/max must satisfy 0 <= min <= max <= 1.")
+
     def calculate_synch_representation_size(self, n_synch):
         """
         Calculate the size of the synchronisation representation based on neuron selection type.
@@ -527,6 +656,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
     def forward(self, x, track=False):
         B = x.size(0)
         device = x.device
+        self.last_thought_attention = None
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -534,6 +664,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         synch_out_tracking = []
         synch_action_tracking = []
         attention_tracking = []
+        thought_attention_tracking = []
 
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
@@ -541,6 +672,10 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # --- Initialise Recurrent State ---
         state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
+        if self.use_thought_attention:
+            thought_memory = torch.zeros(B, self.memory_length, self.thought_memory_dim, device=device, dtype=kv.dtype)
+            thought_valid = torch.zeros(B, self.memory_length, device=device, dtype=torch.bool)
+            static_thought = self.static_thought_encoder(kv.mean(dim=1)) if self.use_static_thought_trace else None
 
         # --- Prepare Storage for Outputs per Iteration ---
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
@@ -574,7 +709,24 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
             # --- Apply Neuron-Level Models ---
-            activated_state = self.trace_processor(state_trace)
+            base_activated_state = self.trace_processor(state_trace)
+            if self.use_thought_attention:
+                thought_context, thought_weights = self.compute_thought_context(
+                    base_activated_state,
+                    thought_memory,
+                    thought_valid,
+                    previous_slot=-1,
+                )
+                thought_update_parts = [attn_out, base_activated_state]
+                if self.use_static_thought_trace:
+                    thought_update_parts.append(static_thought)
+                thought_update_parts.append(thought_context)
+                thought_update_input = torch.cat(thought_update_parts, dim=-1)
+                thought_update = self.thought_update(thought_update_input)
+                thought_gate = torch.sigmoid(self.thought_gate(thought_update_input))
+                activated_state = (1 - thought_gate) * base_activated_state + thought_gate * thought_update
+            else:
+                activated_state = base_activated_state
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
@@ -586,6 +738,17 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             current_prediction = self.output_projector(synchronisation_out)
             current_certainty = self.compute_certainty(current_prediction)
 
+            if self.use_thought_attention:
+                completed_thought = self.make_thought_entry(
+                    state,
+                    activated_state,
+                    synchronisation_out,
+                    current_prediction,
+                )
+                new_valid = torch.ones(B, 1, device=device, dtype=torch.bool)
+                thought_memory = torch.cat((thought_memory[:, 1:], completed_thought.unsqueeze(1)), dim=1)
+                thought_valid = torch.cat((thought_valid[:, 1:], new_valid), dim=1)
+
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
 
@@ -594,11 +757,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
                 post_activations_tracking.append(activated_state.detach().cpu().numpy())
                 attention_tracking.append(attn_weights.detach().cpu().numpy())
+                if self.use_thought_attention:
+                    thought_attention_tracking.append(thought_weights.detach().cpu().numpy())
                 synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
 
         # --- Return Values ---
         if track:
+            self.last_thought_attention = np.array(thought_attention_tracking) if self.use_thought_attention else None
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
 
