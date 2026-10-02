@@ -1,6 +1,7 @@
 import torch
 from torchvision.datasets import ImageFolder
 from torch.utils.data import Dataset
+from collections import deque
 import random
 import numpy as np
 from tqdm.auto import tqdm
@@ -202,6 +203,101 @@ class MazeImageFolder(ImageFolder):
         else:
             return super().__len__()
         
+    @staticmethod
+    def _is_route_cell(cell, include_start=False):
+        """A maze pixel is traversable if it is a corridor (blue) or the end (green);
+        the start (red) is additionally traversable when include_start is set."""
+        if (cell == [0, 0, 1]).all() or (cell == [0, 1, 0]).all():
+            return True
+        return include_start and (cell == [1, 0, 0]).all()
+
+    def _greedy_solution(self, x, start_y, start_x, end_y, end_x):
+        """Priority walk (Up, Down, Left, Right), marking visited cells white.
+
+        Returns the direction sequence padded with waits (4) (or truncated to
+        maze_route_length while still walking, matching the documented slicing
+        behaviour), or None if the walk enters a dead end.
+        """
+        current_y, current_x = start_y, start_x
+        path = []
+
+        while (current_y, current_x) != (end_y, end_x):
+            if len(path) == self.maze_route_length:
+                return path
+
+            next_y, next_x = -1, -1  # Initialize to invalid coordinates
+            direction = -1  # Initialize to an invalid direction
+
+            # Check Up
+            if current_y > 0 and self._is_route_cell(x[current_y - 1, current_x]):
+                next_y, next_x = current_y - 1, current_x
+                direction = 0
+
+            # Check Down
+            elif current_y < x.shape[0] - 1 and self._is_route_cell(x[current_y + 1, current_x]):
+                next_y, next_x = current_y + 1, current_x
+                direction = 1
+
+            # Check Left
+            elif current_x > 0 and self._is_route_cell(x[current_y, current_x - 1]):
+                next_y, next_x = current_y, current_x - 1
+                direction = 2
+
+            # Check Right
+            elif current_x < x.shape[1] - 1 and self._is_route_cell(x[current_y, current_x + 1]):
+                next_y, next_x = current_y, current_x + 1
+                direction = 3
+
+            if direction == -1:
+                return None
+
+            path.append(direction)
+
+            x[current_y, current_x] = [255,255,255] # mark the current as white to avoid going in circles
+            current_y, current_x = next_y, next_x
+
+        # all downstream movement should be appended by waits (4)
+        path += [4] * (self.maze_route_length - len(path))
+        return path
+
+    def _bfs_solution(self, x, start_y, start_x, end_y, end_x):
+        """Breadth-first search over traversable cells.
+
+        Returns the shortest direction sequence padded with waits (4) (or
+        truncated to maze_route_length, matching the documented slicing
+        behaviour), or None if the end is unreachable.
+        """
+        height, width = x.shape[0], x.shape[1]
+        visited = np.zeros((height, width), dtype=bool)
+        visited[start_y, start_x] = True
+        parents = {}
+        queue = deque([(start_y, start_x)])
+
+        while queue:
+            current_y, current_x = queue.popleft()
+            if (current_y, current_x) == (end_y, end_x):
+                path = []
+                node = (current_y, current_x)
+                while node != (start_y, start_x):
+                    parent_y, parent_x, direction = parents[node]
+                    path.append(direction)
+                    node = (parent_y, parent_x)
+                path.reverse()
+                path = path[:self.maze_route_length]
+                path += [4] * (self.maze_route_length - len(path))
+                return path
+
+            for direction, (dy, dx) in enumerate(((-1, 0), (1, 0), (0, -1), (0, 1))):
+                next_y, next_x = current_y + dy, current_x + dx
+                if (0 <= next_y < height and 0 <= next_x < width
+                        and not visited[next_y, next_x]
+                        and self._is_route_cell(x[next_y, next_x], include_start=True)):
+                    visited[next_y, next_x] = True
+                    parents[(next_y, next_x)] = (current_y, current_x, direction)
+                    queue.append((next_y, next_x))
+
+        return None
+
     def get_solution(self, x):
         x = np.copy(x)
         # Find start (red) and end (green) pixel coordinates
@@ -209,49 +305,19 @@ class MazeImageFolder(ImageFolder):
         end_coords = np.argwhere((x == [0, 1, 0]).all(axis=2))
 
         if len(start_coords) == 0 or len(end_coords) == 0:
-            print("Start or end point not found.")
-            return None
-        
+            raise ValueError("Maze image is missing a start (red) or end (green) marker.")
+
         start_y, start_x = start_coords[0]
         end_y, end_x = end_coords[0]
 
-        current_y, current_x = start_y, start_x
-        path = [4] * self.maze_route_length
-
-        pi = 0
-        while (current_y, current_x) != (end_y, end_x):
-            next_y, next_x = -1, -1  # Initialize to invalid coordinates
-            direction = -1  # Initialize to an invalid direction
-
-
-            # Check Up
-            if current_y > 0 and ((x[current_y - 1, current_x] == [0, 0, 1]).all() or (x[current_y - 1, current_x] == [0, 1, 0]).all()):
-                next_y, next_x = current_y - 1, current_x
-                direction = 0
-
-            # Check Down
-            elif current_y < x.shape[0] - 1 and ((x[current_y + 1, current_x] == [0, 0, 1]).all() or (x[current_y + 1, current_x] == [0, 1, 0]).all()):
-                next_y, next_x = current_y + 1, current_x
-                direction = 1
-
-            # Check Left
-            elif current_x > 0 and ((x[current_y, current_x - 1] == [0, 0, 1]).all() or (x[current_y, current_x - 1] == [0, 1, 0]).all()):
-                next_y, next_x = current_y, current_x - 1
-                direction = 2
-                
-            # Check Right
-            elif current_x < x.shape[1] - 1 and ((x[current_y, current_x + 1] == [0, 0, 1]).all() or (x[current_y, current_x + 1] == [0, 1, 0]).all()):
-                next_y, next_x = current_y, current_x + 1
-                direction = 3
-
-            
-            path[pi] = direction
-            pi += 1
-            
-            x[current_y, current_x] = [255,255,255] # mark the current as white to avoid going in circles
-            current_y, current_x = next_y, next_x
-            if pi == len(path): 
-                break
+        # The greedy walk produces identical labels on every maze it can solve.
+        # If it dead-ends, fall back to BFS (run on an unmarked copy) for a
+        # guaranteed shortest route, else fail explicitly.
+        path = self._greedy_solution(np.copy(x), start_y, start_x, end_y, end_x)
+        if path is None:
+            path = self._bfs_solution(x, start_y, start_x, end_y, end_x)
+        if path is None:
+            raise ValueError("Maze has no valid path between the start and end markers.")
 
         return np.array(path)
 
