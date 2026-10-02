@@ -169,7 +169,7 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
             attn_weights = None
             if is_digit_step:
                 q = self.q_proj(synchronization_action).unsqueeze(1)
-                attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+                attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=track)
                 attn_out = attn_out.squeeze(1)
                 pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
             else:

@@ -218,7 +218,7 @@ class LSTMBaseline(nn.Module):
 
             # --- Interact with Data via Attention ---
             q = self.q_proj(hn[-1].unsqueeze(1))
-            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=track)
             lstm_input = attn_out
 
             # --- Apply LSTM ---

@@ -564,7 +564,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Interact with Data via Attention ---
             q = self.q_proj(synchronisation_action).unsqueeze(1)
-            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=track)
             attn_out = attn_out.squeeze(1)
             pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
 

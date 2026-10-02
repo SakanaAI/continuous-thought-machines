@@ -153,7 +153,7 @@ class LSTMBaseline(nn.Module):
             attn_weights = None
             if is_digit_step:
                 q = self.q_proj(hidden_state).unsqueeze(1)
-                attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+                attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=track)
                 lstm_input = attn_out.squeeze(1)
             else:
                 lstm_input = kv
